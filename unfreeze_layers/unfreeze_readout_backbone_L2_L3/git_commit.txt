@@ -1,0 +1,5 @@
+commit 44e98d21a850c1001195a6735a75468b6e8f0442
+Author: Mingjian Wen <wenxx151@gmail.com>
+Date:   Tue Dec 16 09:43:42 2025 +0800
+
+    Update instructions for tp_path_polar only

@@ -1,0 +1,385 @@
+import itertools
+import os
+import shutil
+from pathlib import Path
+from pprint import pprint
+
+import lightning as L
+import pandas as pd
+import torch
+from lightning import Trainer
+from torch_geometric.loader.dataloader import DataLoader
+
+from carnet.data.dataset import DatasetIP
+from carnet.data.transform import ConsecutiveAtomType
+from carnet.model.ip import InteratomicPotential
+from carnet.model.pl.pl_ip import InteratomicPotentialLitModule
+from carnet.model.pl.utils import (
+    get_args,
+    get_git_commit,
+    instantiate_class,
+    load_model,
+)
+
+
+def get_dataset(
+    filename: Path, target_names: list[str], atomic_number: list[int], r_cut: float
+):
+    dataset = DatasetIP(
+        filename=filename,
+        target_names=target_names,
+        r_cut=r_cut,
+        transform=ConsecutiveAtomType(atomic_number),
+        log=False,
+    )
+
+    return dataset
+
+
+def get_dataloaders(
+    atomic_number,
+    r_cut,
+    trainset_filename,
+    valset_filename,
+    testset_filename,
+    train_batch_size,
+    val_batch_size,
+    test_batch_size,
+    target_names=("energy", "forces"),
+):
+
+    trainset = get_dataset(trainset_filename, target_names, atomic_number, r_cut)
+    train_loader = DataLoader(
+        trainset, batch_size=train_batch_size, shuffle=True, drop_last=True
+    )
+
+    valset = get_dataset(valset_filename, target_names, atomic_number, r_cut)
+    val_loader = DataLoader(valset, batch_size=val_batch_size, shuffle=False)
+
+    testset = get_dataset(testset_filename, target_names, atomic_number, r_cut)
+    test_loader = DataLoader(testset, batch_size=test_batch_size, shuffle=False)
+
+    return train_loader, val_loader, test_loader
+
+
+def update_data_configs(config: dict) -> dict:
+    """Get atomic number from the train set, so we do not need to provide it in the
+    config file"""
+
+    atomic_number = config["data"].get("atomic_number", None)
+    if atomic_number is None:
+        filename = config["data"]["trainset_filename"]
+        df = pd.read_json(filename)
+        atomic_number = df["atomic_number"].to_list()
+        unique_atomic_number = sorted(set(itertools.chain.from_iterable(atomic_number)))
+
+        config["data"]["atomic_number"] = unique_atomic_number
+
+        print(f"Updated data configs - `atomic_number`: {unique_atomic_number}")
+
+    return config
+
+
+def update_model_configs(config: dict, dataset: DatasetIP) -> dict:
+    """Update the model configs in the config file.
+
+    A couple of internally determined parameters are added to the `model` section of
+    the config file.
+
+    Args:
+        config: The entire config file.
+        dataset: The dataset object.
+
+    Returns:
+        Update config dict.
+    """
+    # params already provided in the `data` section of the config file
+    num_atom_types = len(config["data"]["atomic_number"])
+    r_cut = config["data"]["r_cut"]
+
+    for name in ["num_atom_types", "r_cut"]:
+        if name in config["model"]:
+            raise ValueError(
+                f"Parameter {name} already provided in the `data` section of the "
+                "config file. Please remove it from the `model` section."
+            )
+
+    # Atomic energy shift values
+    # None: to not use any shift;
+    # "auto": to value determined from dataset
+    # path to file: read atomic energy from file
+    # float/int: to a fixed value
+    shift = config["model"].pop("atomic_energy_shift", None)
+    if shift is None:
+        pass
+    elif isinstance(shift, (float, int)):
+        shift = torch.tensor(shift)
+    elif isinstance(shift, str):
+        if shift.lower() == "auto":
+            shift = dataset.get_mean_atomic_energy()
+        else:
+            # Read atomic energy from file; set to zero for atomic numbers not present
+            if Path(shift).is_file():
+                df = pd.read_json(shift)
+                max_atomic_number = max(df["atomic_number"])
+                shift = torch.zeros(max_atomic_number + 1)
+                for _, row in df.iterrows():
+                    shift[row["atomic_number"]] = row["energy"]
+            else:
+                raise ValueError(
+                    f"File providing energy of individual atoms does not exist: {shift}"
+                )
+    else:
+        raise ValueError(
+            "`atomic_energy_shift` should be either a float/int, 'auto', or a path to "
+            "a file providing atomic energies."
+        )
+
+    scale = config["model"].pop("atomic_energy_scale", None)
+    if scale is None:
+        pass
+    elif isinstance(scale, str):
+        if scale.lower() == "auto":
+            scale = dataset.get_root_mean_square_force()
+        else:
+            raise ValueError(
+                f"`atomic_energy_scale` should be either `None` or `'auto'`; got {scale}"
+            )
+
+    num_average_neigh = config["model"].pop("num_average_neigh", None)
+    if num_average_neigh is None:
+        num_average_neigh = "auto"
+    if num_average_neigh.lower() == "auto":
+        num_average_neigh = dataset.get_num_average_neigh()
+
+    # update config file
+    config["model"]["num_atom_types"] = num_atom_types
+    config["model"]["r_cut"] = r_cut
+    config["model"]["atomic_energy_shift"] = shift
+    config["model"]["atomic_energy_scale"] = scale
+    config["model"]["num_average_neigh"] = num_average_neigh
+
+    print(f"Updated model configs - `num_atom_types`: {num_atom_types}")
+    print(f"Updated model configs - `r_cut`: {r_cut}")
+    print(f"Updated model configs - `atomic_energy_shift`: {shift}")
+    print(f"Updated model configs - `atomic_energy_scale`: {scale}")
+    print(f"Updated model configs - `num_average_neigh`: {num_average_neigh}")
+
+    return config
+
+
+def check_configs(config: dict):
+    if (
+        config["loss"].get("stress_ratio", 0.0) > 1e-6
+        and "stress" not in config["data"]["target_names"]
+    ):
+        raise ValueError(
+            "Config inconsistence: `stress_ratio` is set in `loss`, but `stress` not "
+            "provided in `data.target_names`."
+        )
+
+
+def get_model(
+    model_hparams: dict,
+    loss_hparams=None,
+    metrics_hparams=None,
+    optimizer_hparams=None,
+    lr_scheduler_hparams=None,
+    ema_hparams=None,
+    other_hparams: dict = None,
+):
+    m = InteratomicPotential(**model_hparams)
+
+    # TODO, enable jit
+    # m = torch.jit.script(m)
+
+    # torch.compile cannot work up to pytorch v2.4.0, because we need double gradients
+    # to compute forces. Below is the error:
+    # torch.compile with autograd does not support double backwards
+    # Check the issue: https://github.com/pytorch/pytorch/issues/91469
+    #
+    # m = torch.compile(m)
+    # TODO, It should work for tensor predictions
+
+    model = InteratomicPotentialLitModule(
+        m,
+        loss_hparams=loss_hparams,
+        metrics_hparams=metrics_hparams,
+        optimizer_hparams=optimizer_hparams,
+        lr_scheduler_hparams=lr_scheduler_hparams,
+        ema_hparams=ema_hparams,
+        other_hparams=other_hparams,
+    )
+
+    return model
+
+
+def main(config: dict):
+    L.seed_everything(config["seed_everything"])
+
+    # Set default dtype
+    dtype = config.get("default_dtype", "float32")
+    torch.set_default_dtype(getattr(torch, dtype))
+
+    # Load data
+    config = update_data_configs(config)
+    train_loader, val_loader, test_loader = get_dataloaders(**config["data"])
+
+    # Get model
+    restore_checkpoint = config.pop("restore_checkpoint")
+
+    # Update model
+    config = update_model_configs(config, train_loader.dataset)
+    config["git_commit"] = get_git_commit()
+
+    # Consistence checking
+    check_configs(config)
+
+    # Create new model
+    if restore_checkpoint is None:
+        model = get_model(
+            config["model"],  # do not pop to pass to other_hparams to track with WandB
+            loss_hparams=config.pop("loss"),
+            metrics_hparams=config.pop("metrics"),
+            optimizer_hparams=config.pop("optimizer"),
+            lr_scheduler_hparams=config.pop("lr_scheduler"),
+            ema_hparams=config.pop("ema"),
+            other_hparams=config,
+        )
+    # Load from checkpoint
+    else:
+        print(f"Loading model from checkpoint: {restore_checkpoint}")
+
+        # Pass model hyperparameters to override the ones saved in the checkpoint.
+        # This becomes useful when continuing training from a checkpoint but hoping to
+        # change some hyperparameters, e.g. using a different loss weight or ema ratio.
+        #
+        # Note, given that `ckpt_path=restore_checkpoint` is passed to trainer.fit()
+        # below, anything related to Lightning Trainer, such as lr_scheduler and
+        # optimizer, if changed here, will not be effective, as they will be restored
+        # from the checkpoint.
+        names = {
+            "loss": "loss_hparams",
+            "metrics": "metrics_hparams",
+            "ema": "ema_hparams",
+            # "optimizer": "optimizer_hparams",
+            # "lr_scheduler": "lr_scheduler_hparams",
+        }
+        overrides = {v: config.pop(k) for k, v in names.items()}
+
+        model = load_model(
+            InteratomicPotentialLitModule,
+            InteratomicPotential,
+            restore_checkpoint,
+            overrides=overrides,
+            map_location=torch.device('cpu')
+        )
+
+    # Train
+    try:
+        callbacks = instantiate_class(config["trainer"].pop("callbacks"))
+    except KeyError:
+        callbacks = None
+
+    try:
+        logger = instantiate_class(config["trainer"].pop("logger"))
+
+        ## For DEBUG only, should be commented out
+        ## log gradients, parameter histogram and model topology
+        ## For test run with small max_epoch, you might need to set `log_freq` to a
+        ## smaller value (default is 100) so that this is executed at least once.
+        # logger.watch(model, log="all", log_graph=False, log_freq=1)
+    except KeyError:
+        logger = None
+    
+    # 简单检查各模块的可训练状态
+    def dump_trainable_params(model, filepath):
+        with open(filepath, "w") as f:
+            for name, param in model.model.named_parameters():
+                f.write(f"{name}: requires_grad={param.requires_grad}\n")
+
+    # 冻结 backbone，保持 readout 和 ZBL 可训练
+    for p in model.model.backbone.parameters():
+        p.requires_grad = False
+    for p in model.model.readout.parameters():
+        p.requires_grad = True
+    if model.model.zbl is not None:
+        for p in model.model.zbl.parameters():
+            p.requires_grad = True
+
+    # 验证
+    dump_trainable_params(model, "trainable_params.txt")
+    
+    trainer = Trainer(callbacks=callbacks, logger=logger, **config["trainer"])
+
+    # Pass ckpt_path to trainer.fit() to restore epoch, optimizer state, lr_scheduler
+    # state, callbacks etc. See:
+    # https://lightning.ai/docs/pytorch/1.6.0/common/checkpointing.html#restoring-training-state
+    #
+    # If you just want to use model parameters saved in a checkpoint, which is loaded
+    # above in load_model(), but not restore settings like epoch, comment out
+    # `ckpt_path = restore_checkpint`.
+    #
+    # In a restoring training, if, e.g., lr_scheduler hyperparameters are changed and
+    # new values are provided in `config`, they won't be effective, since their state
+    # will be restored from the checkpoint. Then, if you want to change them, you can
+    # manually update the checkpoint file, e.g. via:
+    # carnet.model.pl.utils.update_checkpoint()
+    #
+    # This will only change stuff that is related to the training process that is
+    # native to lightning, like the ones mentioned above; it will not update stuff
+    # not native to lightning. For example, ema hyperparameters will not be restored
+    # since it is defined in the model class, not in the lightning module.
+    trainer.fit(
+        model,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
+        ckpt_path=None,
+    )
+
+    # Save the last epoch model
+    # The behavior of  `save_last` in ModelCheckpoint callback is buggy; save manually
+    trainer.save_checkpoint("./last_epoch.ckpt")
+
+    # Test results on the best model determined by the validation set
+    out = trainer.test(ckpt_path="best", dataloaders=test_loader)
+    print("Best model test results:", out)
+    print(f"Best checkpoint path: {trainer.checkpoint_callback.best_model_path}")
+
+    # Validation results on best model
+    out = trainer.validate(ckpt_path="best", dataloaders=val_loader)
+    print("Best model val results:", out)
+
+    # Val/test results on the last epoch model
+    # Depending on the settings, this can be
+    # - the last epoch of regular model
+    # - the EMA model
+    # - the SWA model
+    # out = trainer.validate(ckpt_path="./last_epoch.ckpt", dataloaders=val_loader)
+    # print("Last epoch results on val set:", out)
+    #
+    # out = trainer.test(ckpt_path="./last_epoch.ckpt", dataloaders=test_loader)
+    # print("Last epoch results on test set:", out)
+
+
+if __name__ == "__main__":
+
+    config_file = Path(__file__).parent / "configs" / "config_final.yaml"
+
+    config = get_args(config_file)
+    pprint(config)
+
+    # Set wandb proxy
+    os.environ["WANDB_BASE_URL"] = config.pop("wandb_base_url")
+
+    ## If the above does not work, use the below
+    # import swanlab
+    #
+    # # Hijack WandB to use SwanLab
+    # # This makes WandB to run in `offline` mode
+    # swanlab.sync_wandb(wandb_run=False)
+
+    main(config)
+
+    # Remove the processed data directory to save space
+    shutil.rmtree("./processed", ignore_errors=True)

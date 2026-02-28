@@ -272,6 +272,7 @@ def main(config: dict):
             InteratomicPotential,
             restore_checkpoint,
             overrides=overrides,
+            map_location=torch.device('cpu')
         )
 
     # Train
@@ -290,7 +291,28 @@ def main(config: dict):
         # logger.watch(model, log="all", log_graph=False, log_freq=1)
     except KeyError:
         logger = None
+    
+    # 简单检查各模块的可训练状态
+    def dump_trainable_params(model, filepath):
+        with open(filepath, "w") as f:
+            for name, param in model.model.named_parameters():
+                f.write(f"{name}: requires_grad={param.requires_grad}\n")
 
+    # 冻结 backbone，保持 readout 和 ZBL 可训练
+    for p in model.model.backbone.parameters():
+        p.requires_grad = False
+    # 解冻 backbone 的第 3 层（index = 2）
+    for p in model.model.backbone.layers[2].parameters():
+        p.requires_grad = True
+    for p in model.model.readout.parameters():
+        p.requires_grad = True
+    if model.model.zbl is not None:
+        for p in model.model.zbl.parameters():
+            p.requires_grad = True
+
+    # 验证
+    dump_trainable_params(model, "trainable_params.txt")
+    
     trainer = Trainer(callbacks=callbacks, logger=logger, **config["trainer"])
 
     # Pass ckpt_path to trainer.fit() to restore epoch, optimizer state, lr_scheduler
@@ -315,7 +337,7 @@ def main(config: dict):
         model,
         train_dataloaders=train_loader,
         val_dataloaders=val_loader,
-        ckpt_path=restore_checkpoint,
+        ckpt_path=None,
     )
 
     # Save the last epoch model

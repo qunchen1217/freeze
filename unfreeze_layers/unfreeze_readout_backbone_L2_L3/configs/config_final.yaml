@@ -1,0 +1,100 @@
+data:
+  r_cut: 5.0
+  target_names:
+  - energy
+  - forces
+  - stress
+  test_batch_size: 16
+  testset_filename: /home/qunchen/playground/dataset/UNEP-v1/UNEP-v1/251203/unep-v1_n20.json
+  train_batch_size: 16
+  trainset_filename: /home/qunchen/playground/dataset/UNEP-v1/UNEP-v1/251203/unep-v1_n20.json
+  val_batch_size: 16
+  valset_filename: /home/qunchen/playground/dataset/UNEP-v1/UNEP-v1/251203/unep-v1_n20.json
+default_dtype: float32
+ema:
+  beta: 0.999
+  include_online_model: false
+  power: 0.75
+  update_after_step: 1000
+  update_every: 1
+loss:
+  energy_ratio: 1.0
+  forces_ratio: 1.0
+  normalize: true
+  stress_ratio: 10.0
+  type: mae
+lr_scheduler:
+  class_path: torch.optim.lr_scheduler.CosineAnnealingLR
+  init_args:
+    T_max: 100
+    eta_min: 1.0e-06
+metrics:
+  normalize: true
+  type: mae
+  validation_start_epoch: 0
+model:
+  F: 128
+  atomic_energy_scale: auto
+  atomic_energy_shift: auto
+  element_bias: false
+  max_L: 2
+  max_chebyshev_degree: 8
+  max_degree: 3
+  num_average_neigh: auto
+  num_layers: 3
+  output_mlp_hidden_layers:
+  - 128
+  - 128
+  radial_mlp_hidden_layers:
+  - 128
+  - 128
+  radial_part_type: 1
+  residual: true
+  tp_path_mode: full
+  tp_path_polar_only: true
+  use_atomic_dependent_weight: residual
+  use_linear_channel_hyper: false
+  use_linear_channel_input: false
+  use_linear_channel_residual: true
+  use_zbl: false
+  zbl_trainable: true
+optimizer:
+  class_path: torch.optim.AdamW
+  init_args:
+    lr: 0.0002
+    weight_decay: 0
+restore_checkpoint: /home/qunchen/playground/carnet/epoch=50-step=622863.ckpt
+seed_everything: 35
+trainer:
+  accelerator: cpu
+  callbacks:
+  - class_path: lightning.pytorch.callbacks.ModelSummary
+    init_args:
+      max_depth: -1
+  - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+    init_args:
+      logging_interval: null
+  - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+    init_args:
+      mode: min
+      monitor: val_ema/mae_f
+      save_top_k: 3
+      verbose: false
+  - class_path: lightning.pytorch.callbacks.EarlyStopping
+    init_args:
+      mode: min
+      monitor: val_ema/mae_f
+      patience: 40
+      verbose: true
+  check_val_every_n_epoch: 1
+  detect_anomaly: false
+  gradient_clip_val: 100.0
+  inference_mode: false
+  log_every_n_steps: 50
+  logger:
+    class_path: lightning.pytorch.loggers.wandb.WandbLogger
+    init_args:
+      project: 260227_UNEP_D14
+  max_epochs: 2
+  num_nodes: 1
+wandb_base_url: https://api.wandb.ai

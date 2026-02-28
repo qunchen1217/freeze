@@ -1,0 +1,24 @@
+# ===============================
+# training artifacts (all experiments)
+# ===============================
+
+# processed datasets
+**/processed/
+**/*.pt
+
+# wandb runs
+**/wandb/
+**/*.wandb
+
+# logs & tmp
+**/logs/
+**/tmp/
+
+# symlinks created by wandb
+**/debug.log
+**/debug-internal.log
+**/latest-run
+
+# python
+__pycache__/
+*.pyc
