@@ -3,7 +3,7 @@ data:
   target_names:
   - energy
   - forces
-  - stress
+    # - stress
   test_batch_size: 16
   testset_filename: /home/qunchen/playground/dataset/UNEP-v1/UNEP-v1/251203/unep-v1_n20.json
   train_batch_size: 16
@@ -21,7 +21,7 @@ loss:
   energy_ratio: 1.0
   forces_ratio: 1.0
   normalize: true
-  stress_ratio: 10.0
+  stress_ratio: 0.0
   type: mae
 lr_scheduler:
   class_path: torch.optim.lr_scheduler.CosineAnnealingLR
